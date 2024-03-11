@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 )
@@ -69,13 +70,20 @@ func main() {
 		}
 	}
 
-	for header, regions := range allEnrichedRegions {
-		mergedRegions := mergeWindows(regions)
-		fmt.Printf("Enriched regions for header %s:\n", header)
-		for _, region := range mergedRegions {
-			fmt.Printf("  Enriched region: start=%d, end=%d\n", region.start, region.end)
+	// Merge adjacent enriched windows for each header
+	mergedRegionsByHeader := mergeWindows(allEnrichedRegions, *windowSize)
+
+	// Print the merged enriched regions
+	totalMergedRegions := 0
+	for header, regions := range mergedRegionsByHeader {
+		totalMergedRegions += len(regions)
+		for _, region := range regions {
+			fmt.Printf("Header: %s, Start: %d, End: %d\n", header, region.start, region.end)
 		}
 	}
+
+	// Print the total number of merged regions
+	fmt.Printf("\nTotal merged regions: %d\n", totalMergedRegions)
 }
 
 func parseSCRAMFile(file string, sRNADataByHeader map[string][]sRNAData) {
@@ -169,14 +177,38 @@ func atoi(s string) int {
 	return i
 }
 
-func mergeWindows(windows []window) []window {
-	var mergedRegions []window
-	for _, w := range windows {
-		if len(mergedRegions) == 0 || w.start > mergedRegions[len(mergedRegions)-1].end {
-			mergedRegions = append(mergedRegions, w)
-		} else {
-			mergedRegions[len(mergedRegions)-1].end = w.end
+func mergeWindows(enrichedRegions map[string][]window, windowSize int) map[string][]window {
+	mergedRegions := make(map[string][]window)
+	for header, windows := range enrichedRegions {
+		sort.Slice(windows, func(i, j int) bool {
+			return windows[i].start < windows[j].start
+		})
+
+		var merged []window
+		var lastMerged *window
+		for _, w := range windows {
+			if lastMerged == nil {
+				lastMerged = &w
+			} else {
+				if w.start <= lastMerged.end+1 {
+					lastMerged.end = w.end
+				} else {
+					if lastMerged.end-lastMerged.start > windowSize {
+						merged = append(merged, *lastMerged)
+					}
+					lastMerged = &w
+				}
+			}
+		}
+
+		if lastMerged != nil && lastMerged.end-lastMerged.start > windowSize {
+			merged = append(merged, *lastMerged)
+		}
+
+		if len(merged) > 0 {
+			mergedRegions[header] = merged
 		}
 	}
+
 	return mergedRegions
 }
