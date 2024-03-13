@@ -29,9 +29,12 @@ type window struct {
 func main() {
 	// Define command-line flags
 	inputFile := flag.String("input", "", "Input CSV file")
+	outputFile := flag.String("output", "enriched_windows.csv", "Output CSV file")
 	windowSize := flag.Int("window", 100, "Window size")
 	minUniqueSRNAs := flag.Int("min-unique", 5, "Minimum number of unique sRNAs")
 	minAvgRPMR := flag.Float64("min-rpmr", 10.0, "Minimum average RPMR")
+	maxTimesAligned := flag.Int("max-times-aligned", 5, "Maximum times aligned cutoff")
+	mergeDistance := flag.Int("merge-distance", 100, "Merge distance for windows")
 	flag.Parse()
 
 	// Validate command-line flags
@@ -52,7 +55,7 @@ func main() {
 		wg.Add(1)
 		go func(header string, sRNAData []sRNAData) {
 			defer wg.Done()
-			regions := processHeader(header, sRNAData, *windowSize, *minUniqueSRNAs, *minAvgRPMR)
+			regions := processHeader(header, sRNAData, *windowSize, *minUniqueSRNAs, *minAvgRPMR, *maxTimesAligned)
 			enrichedRegionsByHeader <- regions
 		}(header, alignData)
 	}
@@ -71,19 +74,50 @@ func main() {
 	}
 
 	// Merge adjacent enriched windows for each header
-	mergedRegionsByHeader := mergeWindows(allEnrichedRegions, *windowSize)
+	mergeWindows(allEnrichedRegions, *mergeDistance)
 
-	// Print the merged enriched regions
-	totalMergedRegions := 0
-	for header, regions := range mergedRegionsByHeader {
-		totalMergedRegions += len(regions)
+	// Write windows to CSV
+	writeWindowsToCSV(allEnrichedRegions, sRNADataByHeader, *outputFile)
+
+	// Print the total number of windows written to CSV
+	totalWindows := 0
+	for _, regions := range allEnrichedRegions {
+		totalWindows += len(regions)
+	}
+	fmt.Printf("\nTotal windows written to CSV: %d\n", totalWindows)
+}
+
+func writeWindowsToCSV(enrichedRegions map[string][]window, sRNADataByHeader map[string][]sRNAData, outputFile string) {
+	file, err := os.Create(outputFile)
+	if err != nil {
+		fmt.Printf("Error creating CSV file: %s\n", err)
+		return
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// Write CSV header
+	header := []string{"Header", "Start", "End", "Length"}
+	writer.Write(header)
+
+	for header, regions := range enrichedRegions {
 		for _, region := range regions {
-			fmt.Printf("Header: %s, Start: %d, End: %d\n", header, region.start, region.end)
+			sRNAData := sRNADataByHeader[header]
+			seqLength := sRNAData[len(sRNAData)-1].Position
+			end := min(region.end, seqLength)
+			length := end - region.start
+
+			row := []string{
+				header,
+				strconv.Itoa(region.start),
+				strconv.Itoa(end),
+				strconv.Itoa(length),
+			}
+			writer.Write(row)
 		}
 	}
-
-	// Print the total number of merged regions
-	fmt.Printf("\nTotal merged regions: %d\n", totalMergedRegions)
 }
 
 func parseSCRAMFile(file string, sRNADataByHeader map[string][]sRNAData) {
@@ -124,13 +158,17 @@ func parseSCRAMFile(file string, sRNADataByHeader map[string][]sRNAData) {
 	}
 }
 
-func processHeader(header string, sRNAData []sRNAData, windowSize, minUniqueSRNAs int, minAvgRPMR float64) map[string][]window {
+func processHeader(header string, sRNAData []sRNAData, windowSize, minUniqueSRNAs int, minAvgRPMR float64, maxTimesAligned int) map[string][]window {
 	// Count unique sRNAs and calculate average RPMR per window
 	windowCounts := make(map[window]struct {
 		uniqueCount int
 		avgRPMR     []float64
 	})
 	for _, sRNA := range sRNAData {
+		if sRNA.TimesAligned > maxTimesAligned {
+			continue // Skip sRNAs that exceed the 'times aligned' cutoff
+		}
+
 		windowStart := (sRNA.Position / windowSize) * windowSize
 		windowEnd := windowStart + windowSize
 		w := window{windowStart, windowEnd}
@@ -142,14 +180,6 @@ func processHeader(header string, sRNAData []sRNAData, windowSize, minUniqueSRNA
 		counts.uniqueCount++
 		for i, rpmr := range sRNA.Replicates {
 			counts.avgRPMR[i] += rpmr
-		}
-		windowCounts[w] = counts
-	}
-
-	// Calculate average RPMR for each window
-	for w, counts := range windowCounts {
-		for i := range counts.avgRPMR {
-			counts.avgRPMR[i] /= float64(counts.uniqueCount)
 		}
 		windowCounts[w] = counts
 	}
@@ -177,8 +207,7 @@ func atoi(s string) int {
 	return i
 }
 
-func mergeWindows(enrichedRegions map[string][]window, windowSize int) map[string][]window {
-	mergedRegions := make(map[string][]window)
+func mergeWindows(enrichedRegions map[string][]window, mergeDistance int) {
 	for header, windows := range enrichedRegions {
 		sort.Slice(windows, func(i, j int) bool {
 			return windows[i].start < windows[j].start
@@ -186,29 +215,26 @@ func mergeWindows(enrichedRegions map[string][]window, windowSize int) map[strin
 
 		var merged []window
 		var lastMerged *window
-		for _, w := range windows {
+		for i := 0; i < len(windows); i++ {
+			w := windows[i]
 			if lastMerged == nil {
 				lastMerged = &w
 			} else {
-				if w.start <= lastMerged.end+1 {
+				if w.start-lastMerged.end <= mergeDistance {
 					lastMerged.end = w.end
+					windows = append(windows[:i], windows[i+1:]...)
+					i--
 				} else {
-					if lastMerged.end-lastMerged.start > windowSize {
-						merged = append(merged, *lastMerged)
-					}
+					merged = append(merged, *lastMerged)
 					lastMerged = &w
 				}
 			}
 		}
 
-		if lastMerged != nil && lastMerged.end-lastMerged.start > windowSize {
+		if lastMerged != nil {
 			merged = append(merged, *lastMerged)
 		}
 
-		if len(merged) > 0 {
-			mergedRegions[header] = merged
-		}
+		enrichedRegions[header] = merged
 	}
-
-	return mergedRegions
 }
