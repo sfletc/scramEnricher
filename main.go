@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"encoding/csv"
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -28,36 +31,54 @@ type window struct {
 
 func main() {
 	// Define command-line flags
-	inputFile := flag.String("input", "", "Input CSV file")
+	inputFiles := flag.String("input", "", "Comma-separated list of input CSV files")
 	outputFile := flag.String("output", "enriched_windows.csv", "Output CSV file")
 	windowSize := flag.Int("window", 100, "Window size")
 	minUniqueSRNAs := flag.Int("min-unique", 5, "Minimum number of unique sRNAs")
 	minAvgRPMR := flag.Float64("min-rpmr", 10.0, "Minimum average RPMR")
 	maxTimesAligned := flag.Int("max-times-aligned", 5, "Maximum times aligned cutoff")
 	mergeDistance := flag.Int("merge-distance", 100, "Merge distance for windows")
+	referenceFile := flag.String("reference", "", "FASTA reference file (optional)")
+	outputFastaFile := flag.String("output-fasta", "", "Output FASTA file (optional)")
 	flag.Parse()
 
 	// Validate command-line flags
-	if *inputFile == "" {
-		fmt.Println("Please provide an input file using the -input flag")
+	if *inputFiles == "" {
+		fmt.Println("Please provide input files using the -input flag")
 		os.Exit(1)
 	}
 
-	// Parse the SCRAM output CSV file
-	sRNADataByHeader := make(map[string][]sRNAData)
-	parseSCRAMFile(*inputFile, sRNADataByHeader)
+	// Parse the list of input files
+	fileList := strings.Split(*inputFiles, ",")
+	// Parse each SCRAM output CSV file
+	sRNADataByFile := make(map[string]map[string][]sRNAData)
+	for _, file := range fileList {
+		sRNADataByHeader := make(map[string][]sRNAData)
+		parseSCRAMFile(file, sRNADataByHeader)
+		sRNADataByFile[file] = sRNADataByHeader
+	}
 
-	// Process each unique header concurrently
+	// Collect unique headers from all files
+	uniqueHeaders := make(map[string]bool)
+	sRNADataByHeader := make(map[string][]sRNAData)
+	for _, sRNADataByFile := range sRNADataByFile {
+		for header, sRNAData := range sRNADataByFile {
+			uniqueHeaders[header] = true
+			sRNADataByHeader[header] = append(sRNADataByHeader[header], sRNAData...)
+		}
+	}
+
+	// Process each unique header concurrently across all files
 	var wg sync.WaitGroup
 	enrichedRegionsByHeader := make(chan map[string][]window)
 
-	for header, alignData := range sRNADataByHeader {
+	for header := range uniqueHeaders {
 		wg.Add(1)
-		go func(header string, sRNAData []sRNAData) {
+		go func(header string) {
 			defer wg.Done()
-			regions := processHeader(header, sRNAData, *windowSize, *minUniqueSRNAs, *minAvgRPMR, *maxTimesAligned)
+			regions := processHeader(header, sRNADataByHeader[header], *windowSize, *minUniqueSRNAs, *minAvgRPMR, *maxTimesAligned)
 			enrichedRegionsByHeader <- regions
-		}(header, alignData)
+		}(header)
 	}
 
 	go func() {
@@ -72,9 +93,25 @@ func main() {
 			allEnrichedRegions[header] = append(allEnrichedRegions[header], regions...)
 		}
 	}
-
-	// Merge adjacent enriched windows for each header
+	// Merge adjacent enriched windows for each header across all files
 	mergeWindows(allEnrichedRegions, *mergeDistance)
+
+	// Load reference sequences from FASTA file
+	referenceSeqs := make(map[string]string)
+	if *referenceFile != "" {
+		err := loadReferenceSequences(*referenceFile, referenceSeqs)
+		if err != nil {
+			fmt.Printf("Error loading reference sequences: %v\n", err)
+		}
+	}
+
+	// Extract sequences in enriched windows and write to FASTA file
+	if *outputFastaFile != "" && len(referenceSeqs) > 0 {
+		err := writeEnrichedSequencesToFasta(allEnrichedRegions, referenceSeqs, *outputFastaFile)
+		if err != nil {
+			fmt.Printf("Error writing enriched sequences to FASTA file: %v\n", err)
+		}
+	}
 
 	// Write windows to CSV
 	writeWindowsToCSV(allEnrichedRegions, sRNADataByHeader, *outputFile)
@@ -121,6 +158,7 @@ func writeWindowsToCSV(enrichedRegions map[string][]window, sRNADataByHeader map
 }
 
 func parseSCRAMFile(file string, sRNADataByHeader map[string][]sRNAData) {
+	log.Printf("Parsing file: %s\n", file)
 	f, err := os.Open(file)
 	if err != nil {
 		fmt.Printf("Error opening file: %s\n", err)
@@ -237,4 +275,64 @@ func mergeWindows(enrichedRegions map[string][]window, mergeDistance int) {
 
 		enrichedRegions[header] = merged
 	}
+}
+
+func loadReferenceSequences(file string, referenceSeqs map[string]string) error {
+	f, err := os.Open(file)
+	if err != nil {
+		return fmt.Errorf("error opening reference file: %v", err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	var header string
+	var seq strings.Builder
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, ">") {
+			if header != "" {
+				referenceSeqs[header] = seq.String()
+				seq.Reset()
+			}
+			header = strings.TrimPrefix(line, ">")
+		} else {
+			seq.WriteString(line)
+		}
+	}
+
+	if header != "" {
+		referenceSeqs[header] = seq.String()
+	}
+
+	return nil
+}
+
+func writeEnrichedSequencesToFasta(enrichedRegions map[string][]window, referenceSeqs map[string]string, outputFile string) error {
+	f, err := os.Create(outputFile)
+	if err != nil {
+		return fmt.Errorf("error creating output FASTA file: %v", err)
+	}
+	defer f.Close()
+
+	writer := bufio.NewWriter(f)
+
+	for header, regions := range enrichedRegions {
+		refSeq, ok := referenceSeqs[header]
+		if !ok {
+			continue
+		}
+
+		for i, region := range regions {
+			start := region.start
+			end := min(region.end, len(refSeq))
+			seq := refSeq[start:end]
+
+			fmt.Fprintf(writer, ">%s_region_%d\n", header, i+1)
+			fmt.Fprintf(writer, "%s\n", seq)
+		}
+	}
+
+	writer.Flush()
+	return nil
 }
