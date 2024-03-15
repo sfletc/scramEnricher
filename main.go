@@ -317,6 +317,12 @@ func writeEnrichedSequencesToFasta(enrichedRegions map[string][]window, referenc
 
 	writer := bufio.NewWriter(f)
 
+	var enrichedSeqs []struct {
+		header string
+		seq    string
+		length int
+	}
+
 	for header, regions := range enrichedRegions {
 		refSeq, ok := referenceSeqs[header]
 		if !ok {
@@ -328,9 +334,25 @@ func writeEnrichedSequencesToFasta(enrichedRegions map[string][]window, referenc
 			end := min(region.end, len(refSeq))
 			seq := refSeq[start:end]
 
-			fmt.Fprintf(writer, ">%s_region_%d\n", header, i+1)
-			fmt.Fprintf(writer, "%s\n", seq)
+			enrichedSeqs = append(enrichedSeqs, struct {
+				header string
+				seq    string
+				length int
+			}{
+				header: fmt.Sprintf(">%s_region_%d", header, i+1),
+				seq:    seq,
+				length: len(seq),
+			})
 		}
+	}
+
+	sort.Slice(enrichedSeqs, func(i, j int) bool {
+		return enrichedSeqs[i].length > enrichedSeqs[j].length
+	})
+
+	for _, enrichedSeq := range enrichedSeqs {
+		fmt.Fprintf(writer, "%s\n", enrichedSeq.header)
+		fmt.Fprintf(writer, "%s\n", enrichedSeq.seq)
 	}
 
 	writer.Flush()
