@@ -24,4 +24,4 @@ Usage of scramEnricher:
         FASTA reference file (optional)
   -window int
         Window size (default 100)
-``
+```
