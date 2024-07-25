@@ -295,7 +295,7 @@ func loadReferenceSequences(file string, referenceSeqs map[string]string) error 
 				referenceSeqs[header] = seq.String()
 				seq.Reset()
 			}
-			header = strings.TrimPrefix(line, ">")
+			header = strings.SplitN(strings.TrimPrefix(line, ">"), " ", 2)[0]
 		} else {
 			seq.WriteString(line)
 		}
